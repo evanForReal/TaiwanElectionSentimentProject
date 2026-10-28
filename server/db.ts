@@ -85,9 +85,36 @@ CREATE TABLE IF NOT EXISTS collections (
   updated_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS rooms_project ON rooms(project_id);
+`);
+
+// Pins are many-to-many with collections. Databases from before that change stored a single
+// collection_id on each pin; rebuild that table and carry the memberships over.
+const pinColumns = (db.prepare("PRAGMA table_info(pins)").all() as { name: string }[]).map((c) => c.name);
+const legacyPins = pinColumns.includes("collection_id");
+db.exec(`
+CREATE TABLE IF NOT EXISTS collection_pins (
+  collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+  pin_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (collection_id, pin_id)
+);
+CREATE INDEX IF NOT EXISTS collection_pins_pin ON collection_pins(pin_id);
+`);
+if (legacyPins) {
+  db.transaction(() => {
+    db.exec(`
+      INSERT OR IGNORE INTO collection_pins (collection_id, pin_id, created_at) SELECT collection_id, id, created_at FROM pins;
+      CREATE TABLE pins_new (id TEXT PRIMARY KEY, image_id TEXT, image_url TEXT, title TEXT NOT NULL DEFAULT '', link TEXT, pinterest_pin_id TEXT, created_at TEXT NOT NULL);
+      INSERT INTO pins_new SELECT id, image_id, image_url, title, link, pinterest_pin_id, created_at FROM pins;
+      DROP TABLE pins;
+      ALTER TABLE pins_new RENAME TO pins;
+    `);
+  })();
+}
+db.exec(`
 CREATE TABLE IF NOT EXISTS pins (
   id TEXT PRIMARY KEY,
-  collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
   image_id TEXT,
   image_url TEXT,
   title TEXT NOT NULL DEFAULT '',
@@ -95,9 +122,12 @@ CREATE TABLE IF NOT EXISTS pins (
   pinterest_pin_id TEXT,
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS pins_collection ON pins(collection_id);
-CREATE INDEX IF NOT EXISTS rooms_project ON rooms(project_id);
+CREATE INDEX IF NOT EXISTS pins_pinterest ON pins(pinterest_pin_id);
 `);
+
+// Rooms gained a style link (board + last fit check)
+const roomColumns = (db.prepare("PRAGMA table_info(rooms)").all() as { name: string }[]).map((c) => c.name);
+if (!roomColumns.includes("style")) db.exec("ALTER TABLE rooms ADD COLUMN style TEXT");
 
 export function getSetting(key: string): string | null {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;

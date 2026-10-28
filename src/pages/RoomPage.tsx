@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { Layout, LibraryItem, Placement, Room, RoomConfiguration, RoomState } from "../../shared/types.ts";
+import type { ArrangeProposal, Layout, LibraryItem, Placement, Room, RoomConfiguration, RoomState, RoomStyle } from "../../shared/types.ts";
 import { floorPolygon, layoutBounds, layoutObstacles, obbCorners, obbOverlap, pointInPolygon, polygonCentroid, snapAngle } from "../../shared/geometry.ts";
 import { api } from "../lib/api.ts";
 import { newLocalId } from "../lib/ids.ts";
@@ -9,6 +9,7 @@ import { Icon, Modal, Seg, Spinner, categoryLabel, useLen } from "../components/
 import { ItemThumb } from "../components/ItemCard.tsx";
 import { LayoutEditor } from "../layout/LayoutEditor.tsx";
 import { RoomScene, isFlat, placementOBB, type CameraPreset, type WallMode } from "../room/RoomScene.tsx";
+import { ArrangeBox, ProposalReview, StylePanel, VERDICT_LABEL, verdictClass } from "../room/RoomAssist.tsx";
 
 type Tab = "layout" | "3d";
 
@@ -43,6 +44,7 @@ export function RoomPage() {
   const [room, setRoom] = useState<Room | null>(null);
   const [layout, setLayout] = useState<Layout | null>(null);
   const [state, setState] = useState<RoomState | null>(null);
+  const [style, setStyle] = useState<RoomStyle | null>(null);
   const [tab, setTab] = useState<Tab>("layout");
   const [draftNotes, setDraftNotes] = useState<{ notes: string; scale: string } | null>(null);
   const [tracing, setTracing] = useState(false);
@@ -54,6 +56,7 @@ export function RoomPage() {
         setRoom(r);
         setLayout(r.layout);
         setState(r.state);
+        setStyle(r.style);
         if (r.layout.lines.length > 0 && r.state.placements.length > 0) setTab("3d");
         const notes = sessionStorage.getItem(`draft-notes:${r.id}`);
         if (notes) {
@@ -84,7 +87,7 @@ export function RoomPage() {
     }
   }
 
-  if (!room || !layout || !state) {
+  if (!room || !layout || !state || !style) {
     return (
       <div className="page">
         <Spinner />
@@ -133,7 +136,19 @@ export function RoomPage() {
       {tab === "layout" ? (
         <LayoutEditor layout={layout} onChange={setLayout} placements={state.placements} items={items} onTraceWithClaude={traceWithClaude} tracing={tracing} />
       ) : (
-        <Room3D layout={layout} state={state} setState={setState} items={items} roomId={room.id} onGoToLayout={() => setTab("layout")} />
+        <Room3D
+          layout={layout}
+          state={state}
+          setState={setState}
+          style={style}
+          onStyleChange={(s) => {
+            setStyle(s);
+            api.updateRoom(room.id, { style: s }).catch(toastError);
+          }}
+          items={items}
+          roomId={room.id}
+          onGoToLayout={() => setTab("layout")}
+        />
       )}
     </div>
   );
@@ -153,6 +168,8 @@ function Room3D({
   layout,
   state,
   setState,
+  style,
+  onStyleChange,
   items,
   roomId,
   onGoToLayout,
@@ -160,6 +177,8 @@ function Room3D({
   layout: Layout;
   state: RoomState;
   setState: (s: RoomState) => void;
+  style: RoomStyle;
+  onStyleChange: (s: RoomStyle) => void;
   items: Map<string, LibraryItem>;
   roomId: string;
   onGoToLayout: () => void;
@@ -176,6 +195,7 @@ function Room3D({
   const [picking, setPicking] = useState(false);
   const [configs, setConfigs] = useState<RoomConfiguration[]>([]);
   const [configName, setConfigName] = useState("");
+  const [proposal, setProposal] = useState<ArrangeProposal | null>(null);
   const past = useRef<RoomState[]>([]);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -270,9 +290,19 @@ function Room3D({
 
   // Collisions: walls (minus openings), fixtures and other pieces, with vertical overlap
   const statics = useMemo(() => layoutObstacles(layout), [layout]);
+  // While a proposal is shown, collisions are checked for the arrangement it would produce
+  const ghosts: Placement[] = useMemo(
+    () =>
+      (proposal?.moves ?? []).map((m, i) => ({ id: `ghost-${i}`, itemId: m.itemId, x: m.x, y: m.y, rotation: m.rotation, elevation: m.elevation, draft: true })),
+    [proposal],
+  );
   const collisions = useMemo(() => {
     const out = new Set<string>();
-    const ps = state.placements.filter((p) => showDrafts || !p.draft);
+    const moved = new Set((proposal?.moves ?? []).map((m) => m.placementId));
+    const ps = [
+      ...state.placements.filter((p) => (showDrafts || !p.draft) && !moved.has(p.id)),
+      ...ghosts,
+    ];
     const boxes = ps.map((p) => {
       const item = items.get(p.itemId);
       return { p, item, obb: isFlat(item) ? null : placementOBB(p, item), top: p.elevation + (item?.model?.dims.h ?? 0) };
@@ -293,7 +323,7 @@ function Room3D({
       }
     }
     return out;
-  }, [state.placements, items, statics, showDrafts]);
+  }, [state.placements, items, statics, showDrafts, ghosts, proposal]);
 
   const obstacleOBBs = (excludeId: string) => [
     ...statics.map((s) => s.obb),
@@ -333,6 +363,28 @@ function Room3D({
 
   const drafts = state.placements.filter((p) => p.draft);
 
+  const flush = () => api.updateRoom(roomId, { state: stateRef.current });
+
+  const applyProposal = () => {
+    if (!proposal) return;
+    const cur = stateRef.current;
+    const staging = [...cur.staging];
+    const placements = cur.placements.map((p) => {
+      const m = proposal.moves.find((x) => x.placementId === p.id);
+      return m ? { ...p, x: m.x, y: m.y, rotation: m.rotation, elevation: m.elevation } : p;
+    });
+    for (const m of proposal.moves.filter((x) => !x.placementId)) {
+      const i = staging.indexOf(m.itemId);
+      if (i >= 0) staging.splice(i, 1);
+      placements.push({ id: newLocalId(), itemId: m.itemId, x: m.x, y: m.y, rotation: m.rotation, elevation: m.elevation, draft: false });
+    }
+    commit({ placements, staging });
+    setProposal(null);
+    toast("Arrangement applied");
+  };
+
+  const verdictFor = (itemId: string) => style.fit?.verdicts.find((v) => v.itemId === itemId) ?? null;
+
   if (layout.lines.length === 0) {
     return (
       <div className="page">
@@ -353,6 +405,7 @@ function Room3D({
         <RoomScene
           layout={layout}
           placements={state.placements}
+          ghosts={ghosts}
           items={items}
           selectedId={selectedId}
           onSelect={setSelectedId}
@@ -441,6 +494,11 @@ function Room3D({
                     {it.model && (
                       <div className="muted">
                         {len(it.model.dims.w)} × {len(it.model.dims.d)}
+                        {verdictFor(itemId) && verdictFor(itemId)!.verdict !== "fits" && (
+                          <span className={`chip ${verdictClass(verdictFor(itemId)!.verdict)}`} style={{ marginLeft: 4 }} title={verdictFor(itemId)!.reason}>
+                            {VERDICT_LABEL[verdictFor(itemId)!.verdict]}
+                          </span>
+                        )}
                       </div>
                     )}
                     <div className="row" style={{ marginTop: 6, gap: 4 }}>
@@ -472,7 +530,15 @@ function Room3D({
       </div>
 
       <aside className="props">
-        {selected && selectedItem ? (
+        {proposal ? (
+          <ProposalReview
+            proposal={proposal}
+            items={items}
+            overlapping={ghosts.filter((g) => collisions.has(g.id)).length}
+            onApply={applyProposal}
+            onDiscard={() => setProposal(null)}
+          />
+        ) : selected && selectedItem ? (
           <div className="stack">
             <div className="row">
               <ItemThumb item={selectedItem} className="thumb" />
@@ -488,6 +554,14 @@ function Room3D({
               </div>
             </div>
             {collisions.has(selected.id) && <div className="error-box">Overlaps a wall, fixture or another piece.</div>}
+            {verdictFor(selected.itemId) && (
+              <div className="small">
+                <span className={`chip ${verdictClass(verdictFor(selected.itemId)!.verdict)}`}>
+                  {VERDICT_LABEL[verdictFor(selected.itemId)!.verdict]} · {verdictFor(selected.itemId)!.score}
+                </span>{" "}
+                <span className="muted">{verdictFor(selected.itemId)!.reason}</span>
+              </div>
+            )}
             {selected.draft && (
               <div className="note-box row">
                 <span style={{ flex: 1 }}>Draft: shown translucent until you keep it.</span>
@@ -553,6 +627,10 @@ function Room3D({
           </div>
         ) : (
           <div className="stack">
+            <ArrangeBox roomId={roomId} state={state} flush={flush} onProposal={(p) => { setProposal(p); setSelectedId(null); }} />
+            <div className="divider" />
+            <StylePanel roomId={roomId} style={style} state={state} items={items} onStyleChange={onStyleChange} flush={flush} />
+            <div className="divider" />
             <div>
               <h3>In this room</h3>
               {state.placements.length === 0 && <div className="muted small">Nothing placed yet. Add pieces to the staging tray below.</div>}
@@ -564,6 +642,11 @@ function Room3D({
                     <ItemThumb item={it} />
                     <span className="grow">{it.name}</span>
                     {p.draft && <span className="chip">draft</span>}
+                    {verdictFor(p.itemId) && verdictFor(p.itemId)!.verdict !== "fits" && (
+                      <span className={`chip ${verdictClass(verdictFor(p.itemId)!.verdict)}`} title={verdictFor(p.itemId)!.reason}>
+                        {VERDICT_LABEL[verdictFor(p.itemId)!.verdict]}
+                      </span>
+                    )}
                     {collisions.has(p.id) && <span className="chip danger">overlap</span>}
                   </div>
                 );

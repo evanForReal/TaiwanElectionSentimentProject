@@ -1,5 +1,7 @@
 import type {
   AppSettings,
+  ArrangeProposal,
+  RoomStyle,
   Collection,
   Dimensions,
   ImageRecord,
@@ -88,8 +90,11 @@ export const api = {
   createRoom: (projectId: string, body: { name?: string; layout?: Partial<Layout>; sourceImageId?: string }) =>
     post<Room>(`/api/projects/${projectId}/rooms`, body),
   room: (id: string) => get<Room>(`/api/rooms/${id}`),
-  updateRoom: (id: string, body: { name?: string; layout?: Layout; state?: RoomState; sourceImageId?: string | null }) =>
+  updateRoom: (id: string, body: { name?: string; layout?: Layout; state?: RoomState; style?: RoomStyle; sourceImageId?: string | null }) =>
     patch<Room>(`/api/rooms/${id}`, body),
+  styleCheck: (roomId: string) => post<Room>(`/api/rooms/${roomId}/style-check`),
+  arrange: (roomId: string, instruction: string, includeStaging: boolean) =>
+    post<ArrangeProposal>(`/api/rooms/${roomId}/arrange`, { instruction, includeStaging }),
   deleteRoom: (id: string) => del(`/api/rooms/${id}`),
   draftLayout: (roomId: string, imageId: string, hint: string) =>
     post<LayoutDraftResponse>(`/api/rooms/${roomId}/draft-layout`, { imageId, hint }),
@@ -103,10 +108,12 @@ export const api = {
   createCollection: (name: string) => post<Collection>("/api/collections", { name }),
   renameCollection: (id: string, name: string) => patch<Collection>(`/api/collections/${id}`, { name }),
   deleteCollection: (id: string) => del(`/api/collections/${id}`),
-  addPins: (id: string, body: { imageIds?: string[]; urls?: string[] }) =>
+  addPins: (id: string, body: { pinIds?: string[]; imageIds?: string[]; urls?: string[] }) =>
     post<{ added: Pin[]; failed: { url: string; error: string }[] }>(`/api/collections/${id}/pins`, body),
-  deletePin: (id: string) => del(`/api/pins/${id}`),
-  movePin: (id: string, collectionId: string, copy: boolean) => post(`/api/pins/${id}/move`, { collectionId, copy }),
+  removePins: (collectionId: string, pinIds: string[]) => post(`/api/collections/${collectionId}/pins/remove`, { pinIds }),
+  allPins: () => get<Pin[]>("/api/pins"),
+  /** Adds pins to `to`; with `from`, moves them out of that collection. */
+  linkPins: (pinIds: string[], to: string, from?: string) => post("/api/pins/link", { pinIds, to, from }),
   summarize: (id: string, pinIds?: string[]) => post<Collection>(`/api/collections/${id}/summarize`, { pinIds }),
   match: (id: string, request: string) => post<MatchResult>(`/api/collections/${id}/match`, { request }),
   setCollectionItems: (id: string, itemIds: string[], mode: "add" | "remove" | "set") =>

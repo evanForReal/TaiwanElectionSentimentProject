@@ -7,16 +7,21 @@ import {
   MATERIAL_KINDS,
   PART_SHAPES,
   type Dimensions,
+  type ArrangeMove,
+  type ArrangeProposal,
+  type FitVerdict,
   type LibraryItem,
   type LineType,
   type ParametricModel,
   type Pin,
+  type Room,
   type StyleSummary,
 } from "../shared/types.ts";
 import { buildTemplateModel } from "../shared/templates.ts";
 import { describeModel, normalizeModel, scaleModelTo } from "../shared/modelOps.ts";
 import { getSetting } from "./db.ts";
 import { imageForClaude } from "./storage.ts";
+import { describeRoom } from "./roomBrief.ts";
 
 export const MODEL = "claude-opus-5-5";
 
@@ -57,15 +62,18 @@ async function structured<S extends z.ZodType>(
   schema: S,
   opts: { system: string; content: Content[]; effort: Effort; maxTokens?: number },
 ): Promise<z.infer<S>> {
-  const res = await client().beta.messages.parse({
+  // Streamed so long thinking on hard requests can't hit HTTP timeouts
+  const res = await client()
+    .beta.messages.stream({
     model: MODEL,
-    max_tokens: opts.maxTokens ?? 16000,
+    max_tokens: opts.maxTokens ?? 32000,
     betas: ["server-side-fallback-2026-07-01"],
     fallbacks: "default",
     system: opts.system,
     messages: [{ role: "user", content: opts.content }],
     output_config: { effort: opts.effort, format: betaZodOutputFormat(schema) },
-  });
+  })
+    .finalMessage();
   if (res.stop_reason === "refusal") {
     throw new Error(`Claude declined this request${res.stop_details?.explanation ? `: ${res.stop_details.explanation}` : "."}`);
   }
@@ -408,4 +416,150 @@ export function explainClaudeError(err: unknown): { status: number; message: str
   if (err instanceof Anthropic.APIConnectionError) return { status: 502, message: "Could not reach the Claude API." };
   if (err instanceof Anthropic.APIError) return { status: 502, message: `Claude API error: ${err.message}` };
   return { status: 500, message: err instanceof Error ? err.message : String(err) };
+}
+
+// ---------- Room style fit ----------
+
+const FitOutput = z.object({
+  verdicts: z.array(
+    z.object({
+      itemId: z.string(),
+      score: z.number().describe("0-100 fit with the style"),
+      verdict: oneOf(["fits", "borderline", "off"]),
+      reason: z.string().describe("One sentence"),
+      fillsEssential: z.string().describe("Name of the style essential this piece covers, or empty string"),
+    }),
+  ),
+  suggestions: z.array(z.string()).describe("Up to 4 concrete changes that would bring the room closer to the style"),
+});
+
+/** Judges every piece in a room against a board's style. */
+export async function checkRoomFit(summary: StyleSummary, items: LibraryItem[]): Promise<{ verdicts: FitVerdict[]; suggestions: string[] }> {
+  if (items.length === 0) return { verdicts: [], suggestions: [] };
+  const content: Content[] = [];
+  for (const it of items.slice(0, 40)) {
+    if (!it.photoIds[0]) continue;
+    content.push({ type: "text", text: `Photo of itemId ${it.id} (${it.name}):` });
+    content.push(...(await imageBlocks([it.photoIds[0]], 512)));
+  }
+  content.push({
+    type: "text",
+    text: `Target style: ${JSON.stringify({
+      styleName: summary.styleName,
+      description: summary.description,
+      palette: summary.palette,
+      materials: summary.materials,
+      essentials: summary.essentials.map((e) => e.name),
+      avoid: summary.avoid,
+    })}
+
+Pieces in the room: ${JSON.stringify(items.map((it) => ({ itemId: it.id, name: it.name, category: it.category, model: describeModel(it.model), notes: it.notes })))}
+
+Give a verdict for every piece: "fits", "borderline" or "off" for this style, with a one-sentence reason grounded in its form, material or color. Then suggest what would most improve the room's match.`,
+  });
+  const out = await structured(FitOutput, {
+    system: "You are an interior designer checking whether the pieces in a room suit a target style. Be specific and honest; a piece can be good quality and still be off-style.",
+    content,
+    effort: "medium",
+  });
+  const valid = new Set(items.map((i) => i.id));
+  return {
+    verdicts: out.verdicts
+      .filter((v) => valid.has(v.itemId))
+      .map((v) => ({
+        itemId: v.itemId,
+        score: Math.round(Math.max(0, Math.min(100, v.score))),
+        verdict: pick(v.verdict, ["fits", "borderline", "off"] as const, "borderline"),
+        reason: v.reason,
+        fillsEssential: v.fillsEssential || null,
+      })),
+    suggestions: out.suggestions.slice(0, 6),
+  };
+}
+
+// ---------- Arranging a room ----------
+
+const ArrangeOutput = z.object({
+  summary: z.string().describe("One or two sentences on what you changed and why"),
+  moves: z.array(
+    z.object({
+      placementId: z.string().describe("Existing placementId, or empty string for a piece taken from the staging tray"),
+      itemId: z.string(),
+      x: z.number(),
+      y: z.number(),
+      rotation: z.number(),
+      elevation: z.number(),
+      reason: z.string(),
+    }),
+  ),
+  notes: z.string().describe("Trade-offs or anything the user should check; empty if none"),
+});
+
+const ARRANGE_SYSTEM = `You arrange furniture in a room plan for an interior-design app. Your output is shown to the user as a translucent proposal they can apply or discard.
+
+Coordinates (follow exactly):
+- Plan coordinates in centimeters: x increases to the right (east), y increases downward on the plan (south).
+- A piece's (x, y) is the center of its footprint. Its width runs along its local left-right axis, its depth along its front-back axis.
+- rotation is in degrees and sets which way the piece's FRONT faces: 0 = faces +y (south), 90 = faces +x (east), 180 = faces -y (north), 270 = faces -x (west). At 0 or 180 the piece's width lies along x; at 90 or 270 it lies along y.
+- elevation is the height of the piece's bottom above the floor (0 for floor furniture; wall art and pendants are higher).
+- Walls are given as centerlines; the usable floor starts half a wall thickness inside them. A piece against a wall has its back face just touching the wall's inner face and its front facing into the room.
+
+Rules:
+- Only move or place what the request calls for. Include a move ONLY for pieces whose pose changes; for those, give the full new pose.
+- Use placementId for pieces already in the room. To place a piece from the staging tray, set placementId to "" and use its itemId.
+- Keep every footprint fully inside the room, clear of walls, fixtures and other pieces (rugs may sit under furniture).
+- Keep door swings and walkways clear: about 90 cm in front of doors and 75 cm for main walking paths. Don't block windows with tall pieces unless asked.
+- Work through the geometry carefully: compute each footprint's extents from its center, rotation, width and depth, and check them against the walls and other pieces before answering.`;
+
+export async function arrangeRoom(
+  room: Room,
+  items: Map<string, LibraryItem>,
+  instruction: string,
+  stagingIds: string[],
+  summary: StyleSummary | null,
+): Promise<ArrangeProposal> {
+  const brief = describeRoom(room, items, stagingIds);
+  const style = summary
+    ? `\n\nThe room follows the "${summary.styleName}" style: ${summary.description} Layout principles: ${summary.layoutPrinciples.join("; ")}.`
+    : "";
+  const out = await structured(ArrangeOutput, {
+    system: ARRANGE_SYSTEM,
+    content: [{ type: "text", text: `${brief}${style}\n\nRequest: "${instruction}"` }],
+    effort: "high",
+    maxTokens: 64000,
+  });
+  const placements = new Map(room.state.placements.map((p) => [p.id, p]));
+  const tray = [...stagingIds];
+  const moves: ArrangeMove[] = [];
+  const fin = (n: number, fallback: number) => (Number.isFinite(n) ? n : fallback);
+  for (const m of out.moves) {
+    if (m.placementId) {
+      const p = placements.get(m.placementId);
+      if (!p) continue;
+      moves.push({
+        placementId: p.id,
+        itemId: p.itemId,
+        x: fin(m.x, p.x),
+        y: fin(m.y, p.y),
+        rotation: (((fin(m.rotation, p.rotation) % 360) + 360) % 360),
+        elevation: Math.max(0, fin(m.elevation, p.elevation)),
+        reason: m.reason,
+      });
+    } else {
+      // Each tray entry can be placed once
+      const i = tray.indexOf(m.itemId);
+      if (i === -1 || !items.get(m.itemId)?.model) continue;
+      tray.splice(i, 1);
+      moves.push({
+        placementId: null,
+        itemId: m.itemId,
+        x: fin(m.x, 0),
+        y: fin(m.y, 0),
+        rotation: (((fin(m.rotation, 0) % 360) + 360) % 360),
+        elevation: Math.max(0, fin(m.elevation, 0)),
+        reason: m.reason,
+      });
+    }
+  }
+  return { summary: out.summary, moves, notes: out.notes };
 }

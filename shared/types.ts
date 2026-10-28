@@ -215,12 +215,31 @@ export interface RoomState {
   staging: string[]; // item ids waiting in the fold-out tray
 }
 
+export interface FitVerdict {
+  itemId: string;
+  score: number; // 0-100 fit with the style
+  verdict: "fits" | "borderline" | "off";
+  reason: string;
+  fillsEssential: string | null;
+}
+
+export interface RoomStyle {
+  collectionId: string | null; // the board whose style this room follows
+  fit: {
+    checkedAt: string;
+    itemIds: string[]; // pieces that were in the room when checked
+    verdicts: FitVerdict[];
+    suggestions: string[];
+  } | null;
+}
+
 export interface Room {
   id: string;
   projectId: string;
   name: string;
   layout: Layout;
   state: RoomState;
+  style: RoomStyle;
   sourceImageId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -245,9 +264,10 @@ export interface Project {
 
 // ---------- Collections (Pinterest boards and in-app moodboards) ----------
 
+/** A saved image. Pins exist on their own and can belong to any number of collections. */
 export interface Pin {
   id: string;
-  collectionId: string;
+  collectionIds: string[];
   imageId: string | null;
   imageUrl: string | null; // original remote URL
   title: string;
@@ -300,6 +320,23 @@ export interface ItemMatch {
 export interface MatchResult {
   matches: ItemMatch[];
   missingEssentials: { name: string; category: string; suggestion: string }[];
+}
+
+/** One piece's proposed pose from a Claude arrangement. placementId is null for pieces coming from the tray. */
+export interface ArrangeMove {
+  placementId: string | null;
+  itemId: string;
+  x: number;
+  y: number;
+  rotation: number;
+  elevation: number;
+  reason: string;
+}
+
+export interface ArrangeProposal {
+  summary: string;
+  moves: ArrangeMove[];
+  notes: string;
 }
 
 // ---------- Images ----------

@@ -9,6 +9,7 @@ import type {
   Room,
   RoomConfiguration,
   RoomState,
+  RoomStyle,
 } from "../shared/types.ts";
 import { db, json, newId, now } from "./db.ts";
 
@@ -163,6 +164,7 @@ interface RoomRow {
   name: string;
   layout: string;
   state: string;
+  style: string | null;
   source_image_id: string | null;
   created_at: string;
   updated_at: string;
@@ -186,6 +188,7 @@ const toRoom = (r: RoomRow): Room => ({
   name: r.name,
   layout: { ...emptyLayout(), ...json<Partial<Layout>>(r.layout, {}) },
   state: json<RoomState>(r.state, { placements: [], staging: [] }),
+  style: json<RoomStyle>(r.style, { collectionId: null, fit: null }),
   sourceImageId: r.source_image_id,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
@@ -203,15 +206,16 @@ export function getRoom(id: string): Room | null {
 export function saveRoom(room: Room) {
   room.updatedAt = now();
   db.prepare(
-    `INSERT INTO rooms (id, project_id, name, layout, state, source_image_id, created_at, updated_at)
-     VALUES (@id, @project_id, @name, @layout, @state, @source_image_id, @created_at, @updated_at)
-     ON CONFLICT(id) DO UPDATE SET name=@name, layout=@layout, state=@state, source_image_id=@source_image_id, updated_at=@updated_at`,
+    `INSERT INTO rooms (id, project_id, name, layout, state, style, source_image_id, created_at, updated_at)
+     VALUES (@id, @project_id, @name, @layout, @state, @style, @source_image_id, @created_at, @updated_at)
+     ON CONFLICT(id) DO UPDATE SET name=@name, layout=@layout, state=@state, style=@style, source_image_id=@source_image_id, updated_at=@updated_at`,
   ).run({
     id: room.id,
     project_id: room.projectId,
     name: room.name,
     layout: JSON.stringify(room.layout),
     state: JSON.stringify(room.state),
+    style: JSON.stringify(room.style),
     source_image_id: room.sourceImageId,
     created_at: room.createdAt,
     updated_at: room.updatedAt,
@@ -260,9 +264,11 @@ export function listCollections(): Collection[] {
   const rows = db.prepare("SELECT * FROM collections ORDER BY updated_at DESC").all() as CollectionRow[];
   return rows.map((r) => {
     const pins = db
-      .prepare("SELECT image_id FROM pins WHERE collection_id = ? AND image_id IS NOT NULL ORDER BY created_at LIMIT 4")
+      .prepare(
+        "SELECT p.image_id FROM pins p JOIN collection_pins cp ON cp.pin_id = p.id WHERE cp.collection_id = ? AND p.image_id IS NOT NULL ORDER BY cp.created_at LIMIT 4",
+      )
       .all(r.id) as { image_id: string }[];
-    const count = (db.prepare("SELECT COUNT(*) AS n FROM pins WHERE collection_id = ?").get(r.id) as { n: number }).n;
+    const count = (db.prepare("SELECT COUNT(*) AS n FROM collection_pins WHERE collection_id = ?").get(r.id) as { n: number }).n;
     return { ...toCollection(r), pinCount: count, coverImageIds: pins.map((p) => p.image_id) };
   });
 }
@@ -294,18 +300,18 @@ export function saveCollection(c: Collection) {
 
 interface PinRow {
   id: string;
-  collection_id: string;
   image_id: string | null;
   image_url: string | null;
   title: string;
   link: string | null;
   pinterest_pin_id: string | null;
   created_at: string;
+  collection_ids: string | null; // comma-separated, from GROUP_CONCAT
 }
 
 const toPin = (r: PinRow): Pin => ({
   id: r.id,
-  collectionId: r.collection_id,
+  collectionIds: r.collection_ids ? r.collection_ids.split(",") : [],
   imageId: r.image_id,
   imageUrl: r.image_url,
   title: r.title,
@@ -314,21 +320,60 @@ const toPin = (r: PinRow): Pin => ({
   createdAt: r.created_at,
 });
 
+const PIN_SELECT = `SELECT p.*, (SELECT GROUP_CONCAT(collection_id) FROM collection_pins WHERE pin_id = p.id) AS collection_ids FROM pins p`;
+
+/** Pins in a collection, in the order they were added to it. */
 export function listPins(collectionId: string): Pin[] {
-  return (db.prepare("SELECT * FROM pins WHERE collection_id = ? ORDER BY created_at").all(collectionId) as PinRow[]).map(toPin);
+  return (
+    db
+      .prepare(`${PIN_SELECT} JOIN collection_pins cp ON cp.pin_id = p.id WHERE cp.collection_id = ? ORDER BY cp.created_at`)
+      .all(collectionId) as PinRow[]
+  ).map(toPin);
+}
+
+export function listAllPins(): Pin[] {
+  return (db.prepare(`${PIN_SELECT} ORDER BY p.created_at DESC`).all() as PinRow[]).map(toPin);
 }
 
 export function getPin(id: string): Pin | null {
-  const r = db.prepare("SELECT * FROM pins WHERE id = ?").get(id) as PinRow | undefined;
+  const r = db.prepare(`${PIN_SELECT} WHERE p.id = ?`).get(id) as PinRow | undefined;
   return r ? toPin(r) : null;
 }
 
-export function insertPin(p: Omit<Pin, "id" | "createdAt">): Pin {
-  const pin: Pin = { ...p, id: newId(), createdAt: now() };
+export function findPinByPinterestId(pinterestPinId: string): Pin | null {
+  const r = db.prepare(`${PIN_SELECT} WHERE p.pinterest_pin_id = ?`).get(pinterestPinId) as PinRow | undefined;
+  return r ? toPin(r) : null;
+}
+
+/** Creates a pin and adds it to a collection. */
+export function insertPin(p: Omit<Pin, "id" | "createdAt" | "collectionIds">, collectionId: string): Pin {
+  const id = newId();
   db.prepare(
-    `INSERT INTO pins (id, collection_id, image_id, image_url, title, link, pinterest_pin_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(pin.id, pin.collectionId, pin.imageId, pin.imageUrl, pin.title, pin.link, pin.pinterestPinId, pin.createdAt);
-  db.prepare("UPDATE collections SET updated_at = ? WHERE id = ?").run(now(), pin.collectionId);
-  return pin;
+    `INSERT INTO pins (id, image_id, image_url, title, link, pinterest_pin_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, p.imageId, p.imageUrl, p.title, p.link, p.pinterestPinId, now());
+  linkPin(id, collectionId);
+  return getPin(id)!;
+}
+
+export function linkPin(pinId: string, collectionId: string): boolean {
+  const r = db
+    .prepare("INSERT OR IGNORE INTO collection_pins (collection_id, pin_id, created_at) VALUES (?, ?, ?)")
+    .run(collectionId, pinId, now());
+  db.prepare("UPDATE collections SET updated_at = ? WHERE id = ?").run(now(), collectionId);
+  return r.changes > 0;
+}
+
+/** Removes a pin from one collection; a pin left in no collection is deleted. */
+export function unlinkPin(pinId: string, collectionId: string) {
+  db.prepare("DELETE FROM collection_pins WHERE collection_id = ? AND pin_id = ?").run(collectionId, pinId);
+  deleteOrphanPins();
+}
+
+export function deleteOrphanPins() {
+  db.prepare("DELETE FROM pins WHERE id NOT IN (SELECT pin_id FROM collection_pins)").run();
+}
+
+export function deletePin(pinId: string) {
+  db.prepare("DELETE FROM collection_pins WHERE pin_id = ?").run(pinId);
+  db.prepare("DELETE FROM pins WHERE id = ?").run(pinId);
 }

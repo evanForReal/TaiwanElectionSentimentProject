@@ -391,6 +391,7 @@ function ControlsLock({ locked }: { locked: boolean }) {
 export interface RoomSceneProps {
   layout: Layout;
   placements: Placement[];
+  ghosts?: Placement[]; // proposed poses, drawn translucent and not interactive
   items: Map<string, LibraryItem>;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
@@ -498,6 +499,23 @@ export function RoomScene(props: RoomSceneProps) {
             onPointerDown={handleDown}
             onPointerMove={handleMove}
             onPointerUp={handleUp}
+          />
+        );
+      })}
+      {(props.ghosts ?? []).map((g) => {
+        const item = items.get(g.itemId);
+        if (!item) return null;
+        return (
+          <PlacedItem
+            key={g.id}
+            placement={g}
+            item={item}
+            selected={false}
+            colliding={collisions.has(g.id)}
+            showDraft
+            onPointerDown={() => {}}
+            onPointerMove={() => {}}
+            onPointerUp={() => {}}
           />
         );
       })}

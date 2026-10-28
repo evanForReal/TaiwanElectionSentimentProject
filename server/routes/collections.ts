@@ -1,7 +1,22 @@
 import type { FastifyInstance } from "fastify";
 import type { Collection } from "../../shared/types.ts";
 import { db, newId, now } from "../db.ts";
-import { getCollection, getItems, getPin, insertPin, listCollections, listItems, listPins, saveCollection } from "../repo.ts";
+import {
+  deleteOrphanPins,
+  deletePin,
+  findPinByPinterestId,
+  getCollection,
+  getItems,
+  getPin,
+  insertPin,
+  linkPin,
+  listAllPins,
+  listCollections,
+  listItems,
+  listPins,
+  saveCollection,
+  unlinkPin,
+} from "../repo.ts";
 import { explainClaudeError, matchItems, summarizeCollection } from "../claude.ts";
 import { downloadImage } from "../storage.ts";
 import {
@@ -47,29 +62,39 @@ export async function collectionRoutes(app: FastifyInstance) {
 
   app.delete<{ Params: { id: string } }>("/api/collections/:id", async (req) => {
     db.prepare("DELETE FROM collections WHERE id = ?").run(req.params.id);
+    deleteOrphanPins();
     return { ok: true };
   });
 
-  /** Adds pins from uploaded image ids and/or pasted URLs. Per-URL failures are reported, not fatal. */
-  app.post<{ Params: { id: string }; Body: { imageIds?: string[]; urls?: string[] } }>(
+  /**
+   * Adds pins to a collection: existing pins by id (a pin can live in many collections),
+   * new uploads by image id, and pasted URLs. Per-URL failures are reported, not fatal.
+   */
+  app.post<{ Params: { id: string }; Body: { pinIds?: string[]; imageIds?: string[]; urls?: string[] } }>(
     "/api/collections/:id/pins",
     async (req, reply) => {
       const c = getCollection(req.params.id);
       if (!c) return reply.code(404).send({ error: "Not found" });
       const added = [];
       const failed: { url: string; error: string }[] = [];
+      for (const pinId of req.body.pinIds ?? []) {
+        if (getPin(pinId) && linkPin(pinId, c.id)) added.push(getPin(pinId)!);
+      }
       for (const imageId of req.body.imageIds ?? []) {
-        added.push(insertPin({ collectionId: c.id, imageId, imageUrl: null, title: "", link: null, pinterestPinId: null }));
+        added.push(insertPin({ imageId, imageUrl: null, title: "", link: null, pinterestPinId: null }, c.id));
       }
       for (const raw of req.body.urls ?? []) {
         const url = raw.trim();
         if (!url) continue;
         try {
           const r = await resolvePastedUrl(url);
+          const existing = r.pinId ? findPinByPinterestId(r.pinId) : null;
+          if (existing) {
+            if (linkPin(existing.id, c.id)) added.push(getPin(existing.id)!);
+            continue;
+          }
           const img = await downloadImage(r.imageUrl);
-          added.push(
-            insertPin({ collectionId: c.id, imageId: img.id, imageUrl: r.imageUrl, title: r.title, link: r.link, pinterestPinId: r.pinId }),
-          );
+          added.push(insertPin({ imageId: img.id, imageUrl: r.imageUrl, title: r.title, link: r.link, pinterestPinId: r.pinId }, c.id));
         } catch (err) {
           failed.push({ url, error: err instanceof Error ? err.message : String(err) });
         }
@@ -78,16 +103,28 @@ export async function collectionRoutes(app: FastifyInstance) {
     },
   );
 
-  app.delete<{ Params: { id: string } }>("/api/pins/:id", async (req) => {
-    db.prepare("DELETE FROM pins WHERE id = ?").run(req.params.id);
+  /** Removes pins from this collection only. Pins left in no collection are deleted. */
+  app.post<{ Params: { id: string }; Body: { pinIds: string[] } }>("/api/collections/:id/pins/remove", async (req) => {
+    for (const pinId of req.body.pinIds ?? []) unlinkPin(pinId, req.params.id);
     return { ok: true };
   });
 
-  app.post<{ Params: { id: string }; Body: { collectionId: string; copy?: boolean } }>("/api/pins/:id/move", async (req, reply) => {
-    const pin = getPin(req.params.id);
-    if (!pin || !getCollection(req.body.collectionId)) return reply.code(404).send({ error: "Not found" });
-    if (req.body.copy) insertPin({ ...pin, collectionId: req.body.collectionId });
-    else db.prepare("UPDATE pins SET collection_id = ? WHERE id = ?").run(req.body.collectionId, pin.id);
+  /** Every pin across all collections, for adding existing pins to another collection. */
+  app.get("/api/pins", async () => listAllPins());
+
+  app.delete<{ Params: { id: string } }>("/api/pins/:id", async (req) => {
+    deletePin(req.params.id);
+    return { ok: true };
+  });
+
+  /** Adds pins to another collection; with `from`, also takes them out of that one (a move). */
+  app.post<{ Body: { pinIds: string[]; to: string; from?: string } }>("/api/pins/link", async (req, reply) => {
+    if (!getCollection(req.body.to)) return reply.code(404).send({ error: "Collection not found" });
+    for (const pinId of req.body.pinIds) {
+      if (!getPin(pinId)) continue;
+      linkPin(pinId, req.body.to);
+      if (req.body.from && req.body.from !== req.body.to) unlinkPin(pinId, req.body.from);
+    }
     return { ok: true };
   });
 
@@ -183,8 +220,13 @@ export async function collectionRoutes(app: FastifyInstance) {
       for (const p of remote) {
         if (have.has(p.id) || !p.imageUrl) continue;
         try {
-          const img = await downloadImage(p.imageUrl);
-          insertPin({ collectionId: c.id, imageId: img.id, imageUrl: p.imageUrl, title: p.title, link: p.link, pinterestPinId: p.id });
+          // A pin already saved in another collection is shared rather than downloaded again
+          const existing = findPinByPinterestId(p.id);
+          if (existing) linkPin(existing.id, c.id);
+          else {
+            const img = await downloadImage(p.imageUrl);
+            insertPin({ imageId: img.id, imageUrl: p.imageUrl, title: p.title, link: p.link, pinterestPinId: p.id }, c.id);
+          }
           added++;
         } catch {
           failed.push(p.id);

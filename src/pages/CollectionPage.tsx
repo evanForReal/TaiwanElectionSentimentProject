@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import type { Collection, MatchResult, Project } from "../../shared/types.ts";
+import type { Collection, MatchResult, Pin, Project } from "../../shared/types.ts";
 import { api, type CollectionWithPins } from "../lib/api.ts";
 import { toast, toastError, useApp, useItemMap } from "../lib/store.ts";
 import { Icon, ImageDrop, Modal, Spinner, categoryLabel } from "../components/ui.tsx";
@@ -24,6 +24,7 @@ export function CollectionPage() {
   const [picking, setPicking] = useState(false);
   const [sending, setSending] = useState(false);
   const [moveMode, setMoveMode] = useState<"move" | "copy" | null>(null);
+  const [addingExisting, setAddingExisting] = useState(false);
 
   const reload = () => api.collection(id).then(setC).catch(toastError);
   useEffect(() => {
@@ -145,6 +146,9 @@ export function CollectionPage() {
               }}
             />
             <div className="row">
+              <button className="btn" onClick={() => setAddingExisting(true)} title="Add images already saved in other collections">
+                From collections
+              </button>
               <input className="input" value={urls} onChange={(e) => setUrls(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addUrls()} placeholder="Paste pin or image links" />
               <button className="btn" disabled={adding || !urls.trim()} onClick={addUrls}>
                 {adding ? <Spinner /> : "Add"}
@@ -159,8 +163,8 @@ export function CollectionPage() {
                 <button className="btn sm" onClick={() => setSelected([])}>
                   Clear
                 </button>
-                <button className="btn sm" onClick={() => setMoveMode("copy")}>
-                  Copy to…
+                <button className="btn sm" onClick={() => setMoveMode("copy")} title="The images stay here too; one image can be in many collections">
+                  Also add to…
                 </button>
                 <button className="btn sm" onClick={() => setMoveMode("move")}>
                   Move to…
@@ -168,8 +172,8 @@ export function CollectionPage() {
                 <button
                   className="btn sm danger"
                   onClick={async () => {
-                    if (!confirm(`Remove ${selected.length} image(s) from this collection?`)) return;
-                    await Promise.all(selected.map((pid) => api.deletePin(pid)));
+                    if (!confirm(`Remove ${selected.length} image(s) from this collection? Images that are in other collections stay there.`)) return;
+                    await api.removePins(c.id, selected);
                     setSelected([]);
                     reload();
                   }}
@@ -203,6 +207,17 @@ export function CollectionPage() {
                   title={p.title}
                 >
                   {p.imageId ? <PhotoThumb id={p.imageId} alt={p.title} /> : <div style={{ height: 120 }} />}
+                  {p.collectionIds.length > 1 && (
+                    <span
+                      className="chip pin-shared"
+                      title={`Also in: ${p.collectionIds
+                        .filter((x) => x !== c.id)
+                        .map((x) => all.find((a) => a.id === x)?.name ?? "another collection")
+                        .join(", ")}`}
+                    >
+                      in {p.collectionIds.length}
+                    </span>
+                  )}
                   <div className="pin-tools">
                     <span className="check">{selected.includes(p.id) ? "✓" : ""}</span>
                     {p.link && (
@@ -380,9 +395,22 @@ export function CollectionPage() {
           }}
         />
       )}
+      {addingExisting && (
+        <PinPicker
+          collections={all}
+          exclude={new Set(c.pins.map((p) => p.id))}
+          onClose={() => setAddingExisting(false)}
+          onPick={async (pinIds) => {
+            await api.addPins(c.id, { pinIds });
+            setAddingExisting(false);
+            toast(`Added ${pinIds.length} image${pinIds.length === 1 ? "" : "s"}`);
+            reload();
+          }}
+        />
+      )}
       {sending && <SendToRoomModal itemIds={c.itemIds} onClose={() => setSending(false)} />}
       {moveMode && (
-        <Modal title={moveMode === "move" ? "Move to collection" : "Copy to collection"} onClose={() => setMoveMode(null)}>
+        <Modal title={moveMode === "move" ? "Move to collection" : "Also add to collection"} onClose={() => setMoveMode(null)}>
           <div className="stack" style={{ gap: 4 }}>
             {all
               .filter((x) => x.id !== c.id)
@@ -391,8 +419,8 @@ export function CollectionPage() {
                   key={x.id}
                   className="list-row"
                   onClick={async () => {
-                    await Promise.all(selected.map((pid) => api.movePin(pid, x.id, moveMode === "copy")));
-                    toast(`${moveMode === "copy" ? "Copied" : "Moved"} ${selected.length} image(s) to ${x.name}`);
+                    await api.linkPins(selected, x.id, moveMode === "move" ? c.id : undefined);
+                    toast(`${moveMode === "copy" ? "Added" : "Moved"} ${selected.length} image(s) to ${x.name}`);
                     setMoveMode(null);
                     setSelected([]);
                     reload();
@@ -518,6 +546,79 @@ function SendToRoomModal({ itemIds, onClose }: { itemIds: string[]; onClose: () 
                 ))}
               </div>
             ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/** Picks pins that already exist in other collections. */
+function PinPicker({
+  collections,
+  exclude,
+  onClose,
+  onPick,
+}: {
+  collections: Collection[];
+  exclude: Set<string>;
+  onClose: () => void;
+  onPick: (pinIds: string[]) => void;
+}) {
+  const [pins, setPins] = useState<Pin[] | null>(null);
+  const [from, setFrom] = useState("all");
+  const [chosen, setChosen] = useState<string[]>([]);
+  useEffect(() => {
+    api.allPins().then(setPins).catch(toastError);
+  }, []);
+  const shown = (pins ?? []).filter((p) => !exclude.has(p.id) && (from === "all" || p.collectionIds.includes(from)));
+  return (
+    <Modal
+      title="Add images from other collections"
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <button className="btn ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn primary" disabled={chosen.length === 0} onClick={() => onPick(chosen)}>
+            Add {chosen.length || ""} image{chosen.length === 1 ? "" : "s"}
+          </button>
+        </>
+      }
+    >
+      <div className="row" style={{ marginBottom: 12 }}>
+        <select className="select" style={{ maxWidth: 260 }} value={from} onChange={(e) => setFrom(e.target.value)}>
+          <option value="all">All collections</option>
+          {collections.map((x) => (
+            <option key={x.id} value={x.id}>
+              {x.name}
+            </option>
+          ))}
+        </select>
+        <button className="btn sm ghost" onClick={() => setChosen(chosen.length === shown.length ? [] : shown.map((p) => p.id))}>
+          {chosen.length === shown.length && shown.length ? "Select none" : "Select all"}
+        </button>
+        <span className="muted small">Images stay in their original collections too.</span>
+      </div>
+      {pins === null ? (
+        <Spinner />
+      ) : shown.length === 0 ? (
+        <div className="muted">No other images to add.</div>
+      ) : (
+        <div className="masonry" style={{ columns: "5 120px" }}>
+          {shown.map((p) => (
+            <div
+              key={p.id}
+              className={`pin ${chosen.includes(p.id) ? "selected" : ""}`}
+              onClick={() => setChosen(chosen.includes(p.id) ? chosen.filter((x) => x !== p.id) : [...chosen, p.id])}
+            >
+              {p.imageId && <PhotoThumb id={p.imageId} alt={p.title} />}
+              <div className="pin-tools">
+                <span className="check">{chosen.includes(p.id) ? "✓" : ""}</span>
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </Modal>

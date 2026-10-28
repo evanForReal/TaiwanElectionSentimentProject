@@ -1,8 +1,8 @@
 import type { FastifyInstance } from "fastify";
-import type { Layout, LayoutLine, Project, Room, RoomState, Zone } from "../../shared/types.ts";
+import type { Layout, LayoutLine, Project, Room, RoomState, RoomStyle, Zone } from "../../shared/types.ts";
 import { db, newId, now } from "../db.ts";
-import { emptyLayout, getProject, getRoom, listConfigurations, listProjects, saveProject, saveRoom } from "../repo.ts";
-import { explainClaudeError, layoutFromImage, type LayoutDraft } from "../claude.ts";
+import { emptyLayout, getCollection, getItems, getProject, getRoom, listConfigurations, listItems, listProjects, saveProject, saveRoom } from "../repo.ts";
+import { arrangeRoom, checkRoomFit, explainClaudeError, layoutFromImage, type LayoutDraft } from "../claude.ts";
 import { getImage } from "../storage.ts";
 
 const ZONE_COLORS = ["#d9c7a7", "#b9c9b1", "#c7b6c9", "#a9bfcf", "#e0b9a3"];
@@ -91,6 +91,7 @@ export async function projectRoutes(app: FastifyInstance) {
         name: req.body.name?.trim() || "New room",
         layout: { ...emptyLayout(), ...(req.body.layout ?? {}) },
         state: { placements: [], staging: [] },
+        style: { collectionId: null, fit: null },
         sourceImageId: req.body.sourceImageId ?? null,
         createdAt: now(),
         updatedAt: now(),
@@ -103,7 +104,7 @@ export async function projectRoutes(app: FastifyInstance) {
     return getRoom(req.params.id) ?? reply.code(404).send({ error: "Not found" });
   });
 
-  app.patch<{ Params: { id: string }; Body: { name?: string; layout?: Layout; state?: RoomState; sourceImageId?: string | null } }>(
+  app.patch<{ Params: { id: string }; Body: { name?: string; layout?: Layout; state?: RoomState; style?: RoomStyle; sourceImageId?: string | null } }>(
     "/api/rooms/:id",
     async (req, reply) => {
       const room = getRoom(req.params.id);
@@ -114,6 +115,7 @@ export async function projectRoutes(app: FastifyInstance) {
         name: b.name ?? room.name,
         layout: b.layout ?? room.layout,
         state: b.state ?? room.state,
+        style: b.style ?? room.style,
         sourceImageId: b.sourceImageId !== undefined ? b.sourceImageId : room.sourceImageId,
       });
     },
@@ -136,6 +138,39 @@ export async function projectRoutes(app: FastifyInstance) {
         scaleReasoning: draft.scaleReasoning,
         imageKind: draft.imageKind,
       };
+    } catch (err) {
+      const e = explainClaudeError(err);
+      return reply.code(e.status).send({ error: e.message });
+    }
+  });
+
+  /** Asks Claude whether each piece in the room (placed or staged) suits the linked board's style. */
+  app.post<{ Params: { id: string } }>("/api/rooms/:id/style-check", async (req, reply) => {
+    const room = getRoom(req.params.id);
+    if (!room) return reply.code(404).send({ error: "Not found" });
+    const c = room.style.collectionId ? getCollection(room.style.collectionId) : null;
+    if (!c?.summary) return reply.code(400).send({ error: "Link this room to a summarized board first." });
+    const itemIds = [...new Set([...room.state.placements.map((p) => p.itemId), ...room.state.staging])];
+    try {
+      const fit = await checkRoomFit(c.summary, getItems(itemIds));
+      return saveRoom({ ...room, style: { ...room.style, fit: { checkedAt: new Date().toISOString(), itemIds, ...fit } } });
+    } catch (err) {
+      const e = explainClaudeError(err);
+      return reply.code(e.status).send({ error: e.message });
+    }
+  });
+
+  /** Asks Claude to move or place pieces. Returns a proposal for the user to apply; nothing is saved. */
+  app.post<{ Params: { id: string }; Body: { instruction: string; includeStaging?: boolean } }>("/api/rooms/:id/arrange", async (req, reply) => {
+    const room = getRoom(req.params.id);
+    if (!room) return reply.code(404).send({ error: "Not found" });
+    const instruction = req.body.instruction?.trim();
+    if (!instruction) return reply.code(400).send({ error: "Describe what you'd like arranged." });
+    const items = new Map(listItems().map((i) => [i.id, i]));
+    const staging = req.body.includeStaging === false ? [] : room.state.staging.filter((id) => items.get(id)?.model);
+    const c = room.style.collectionId ? getCollection(room.style.collectionId) : null;
+    try {
+      return await arrangeRoom(room, items, instruction, staging, c?.summary ?? null);
     } catch (err) {
       const e = explainClaudeError(err);
       return reply.code(e.status).send({ error: e.message });

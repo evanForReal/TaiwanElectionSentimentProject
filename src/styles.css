@@ -1134,6 +1134,13 @@ textarea {
   background: var(--accent);
   border-color: var(--accent);
 }
+.pin .pin-shared {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #2a2622;
+}
 .pin.dimmed {
   opacity: 0.45;
 }
